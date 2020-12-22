@@ -159,6 +159,28 @@ public:
 		return true;
 	}
 
+	void DestroyThread()
+	{
+		mIsWorkerRun = false;
+		CloseHandle(mIOCPHandle);
+
+		for (auto& thr : mIOWorkerThreads)
+		{
+			if (thr.joinable())
+			{
+				thr.join();
+			}
+		}
+
+		mIsAccepterRun = false;
+		closesocket(mListenSocket);
+
+		if (mAccepterThread.joinable()) // 스레드 활성여부 판단
+		{
+			mAccepterThread.join(); // 스레드가 종료될 때가지 기다림
+		}
+	}
+
 private:
 	void CreateClient(const UINT32 _maxClientCnt)
 	{
@@ -190,11 +212,198 @@ private:
 
 	void WorkerThread()
 	{
+		stClientInfo* pClientInfo = NULL;
+		BOOL bSuccess = TRUE;
+		DWORD dwIoSize = 0;
+		LPOVERLAPPED lpOverlapped = NULL;
 
+		while (mIsWorkerRun)
+		{
+			bSuccess = GetQueuedCompletionStatus(mIOCPHandle,
+				&dwIoSize,										// 실제 전송된 바이트 수
+				(PULONG_PTR)&pClientInfo,						// Completion Key
+				&lpOverlapped,									// Overlapped IO 
+				INFINITE);
+
+			// 사용자 스레드 종료 메세지
+			if (bSuccess == TRUE && dwIoSize == 0 && lpOverlapped == NULL)
+			{
+				mIsWorkerRun = false;
+				continue;
+			}
+
+			// 클라이언트 접속 종료 메세지
+			if (bSuccess == FALSE || (dwIoSize == 0 && bSuccess == TRUE))
+			{
+				printf("socket(%d) disconnected\n", (int)pClientInfo->m_socketClient);
+				CloseSocket(pClientInfo);
+				continue;
+			}
+
+			if (NULL == lpOverlapped)
+			{
+				continue;
+			}
+
+			stOverlappedEx* pOverlappedEx = (stOverlappedEx*)lpOverlapped;
+
+			if (pOverlappedEx->m_eOperation == IOOperation::RECV)
+			{
+				pOverlappedEx->m_szBuf[dwIoSize] = NULL;
+				printf("[RECV] bytes : %d, msg : %s\n", dwIoSize, pOverlappedEx->m_szBuf);
+
+				SendMsg(pClientInfo, pOverlappedEx->m_szBuf, dwIoSize);
+				BindRecv(pClientInfo);
+			}
+			else if (pOverlappedEx->m_eOperation == IOOperation::SEND)
+			{
+				printf("[SEND] bytes : %d, msg : %s\n", dwIoSize, pOverlappedEx->m_szBuf);
+			}
+			else
+			{
+				printf("[Exception] socket : %d\n", (int)pClientInfo->m_socketClient);
+			}
+		}
 	}
 
 	void AccepterThread()
 	{
+		SOCKADDR_IN stClientAddr;
+		int nAddrLen = sizeof(SOCKADDR_IN);
 
+		while (mIsAccepterRun)
+		{
+			stClientInfo* pClientInfo = GetEmptyClientInfo();
+			if (pClientInfo == NULL)
+			{
+				printf("[Error] Client Full\n");
+				return;
+			}
+
+			pClientInfo->m_socketClient = accept(mListenSocket, (SOCKADDR*)&stClientAddr, &nAddrLen);
+			if (pClientInfo->m_socketClient == INVALID_SOCKET)
+			{
+				continue;
+			}
+
+			bool bRet = BindIOCompletionPort(pClientInfo);
+			if (bRet == false)
+			{
+				return;
+			}
+
+			// 초기 받기 수행
+			bRet = BindRecv(pClientInfo);
+			if (bRet == false)
+			{
+				return;
+			}
+
+			char clientIP[32] = { 0, };
+			inet_ntop(AF_INET, &(stClientAddr.sin_addr), clientIP, 32 - 1);
+			printf("[Accept] : IP(%s) SOCKET(%d)\n", clientIP, (int)pClientInfo->m_socketClient);
+
+			++mClientCnt;
+		}
+	}
+
+	void CloseSocket(stClientInfo* _pClientInfo, bool _bIsForce = false)
+	{
+		struct linger stLinger = { 0, 0 };
+
+		if (_bIsForce == true)
+		{
+			stLinger.l_onoff = 1; // (1 = 설정 & 송신 버퍼의 자료가 모두 전송된 것이 확인될 때까지 지연, 0 = 해제 & 의미없음)
+		}
+
+		shutdown(_pClientInfo->m_socketClient, SD_BOTH);
+
+		setsockopt(_pClientInfo->m_socketClient, SOL_SOCKET, SO_LINGER, (char*)&stLinger, sizeof(stLinger));
+
+		closesocket(_pClientInfo->m_socketClient);
+
+		_pClientInfo->m_socketClient = INVALID_SOCKET;
+	}
+
+	bool BindRecv(stClientInfo* _pClientInfo)
+	{
+		DWORD dwFlag = 0;
+		DWORD dwRecvNumBytes = 0;
+
+		_pClientInfo->m_stRecvOverlappedEx.m_wsaBuf.len = MAX_SOCKBUF;
+		_pClientInfo->m_stRecvOverlappedEx.m_wsaBuf.buf = _pClientInfo->m_stRecvOverlappedEx.m_szBuf; // buf 포인터가 szBuf를 가리킴
+		_pClientInfo->m_stRecvOverlappedEx.m_eOperation = IOOperation::RECV;
+
+		int nRet = WSARecv(_pClientInfo->m_socketClient,
+			&(_pClientInfo->m_stRecvOverlappedEx.m_wsaBuf),
+			1,
+			&dwRecvNumBytes,
+			&dwFlag,
+			(LPWSAOVERLAPPED) & (_pClientInfo->m_stRecvOverlappedEx),
+			NULL);
+
+		if (nRet == SOCKET_ERROR && (WSAGetLastError() != ERROR_IO_PENDING))
+		{
+			printf("error msg : %d\n", WSAGetLastError());
+			return false;
+		}
+
+		return true;
+	}
+
+	bool SendMsg(stClientInfo* _pClientInfo, char* _pMsg, int _nLen)
+	{
+		DWORD dwSendNumBytes = 0;
+
+		CopyMemory(_pClientInfo->m_stSendOverlappedEx.m_szBuf, _pMsg, _nLen);
+
+		_pClientInfo->m_stSendOverlappedEx.m_wsaBuf.len = _nLen;
+		_pClientInfo->m_stSendOverlappedEx.m_wsaBuf.buf = _pClientInfo->m_stSendOverlappedEx.m_szBuf; // buf 포인터가 szBuf를 가리킴
+		_pClientInfo->m_stSendOverlappedEx.m_eOperation = IOOperation::SEND;
+
+		int nRet = WSASend(_pClientInfo->m_socketClient,
+			&(_pClientInfo->m_stSendOverlappedEx.m_wsaBuf),
+			1,
+			&dwSendNumBytes,
+			0,
+			(LPWSAOVERLAPPED) & (_pClientInfo->m_stSendOverlappedEx),
+			NULL);
+
+		if (nRet == SOCKET_ERROR && (WSAGetLastError() != ERROR_IO_PENDING))
+		{
+			printf("error msg : %d\n", WSAGetLastError());
+			return false;
+		}
+
+		return true;
+	}
+
+	stClientInfo* GetEmptyClientInfo()
+	{
+		for (auto& client : mClientInfos)
+		{
+			if (client.m_socketClient == INVALID_SOCKET)
+			{
+				return &client;
+			}
+		}
+
+		return nullptr;
+	}
+
+	bool BindIOCompletionPort(stClientInfo* _pClientInfo)
+	{
+		auto hIOCP = CreateIoCompletionPort((HANDLE)_pClientInfo->m_socketClient
+			, mIOCPHandle
+			, (ULONG_PTR)(_pClientInfo)
+			, 0);
+
+		if (hIOCP == NULL || mIOCPHandle != hIOCP)
+		{
+			printf("error msg : %s\n", GetLastError());
+			return false;
+		}
+
+		return true;
 	}
 };
