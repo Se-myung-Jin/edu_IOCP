@@ -33,3 +33,8 @@
 
 # Custom
 *.suo
+*.ipch
+*.db
+*.opendb
+*.filters
+*.user
