@@ -59,7 +59,7 @@ public:
 	{
 		SOCKADDR_IN stServerAddr;
 		stServerAddr.sin_family = AF_INET;
-		stServerAddr.sin_port = _port;
+		stServerAddr.sin_port = htons(_port);
 		stServerAddr.sin_addr.s_addr = htonl(INADDR_ANY);
 
 		int nRet = bind(mListenSocket, (SOCKADDR*)&stServerAddr, sizeof(SOCKADDR_IN));
