@@ -32,7 +32,7 @@ public:
 
 	UINT32 GetIndex() { return mIndex; }
 
-	bool IsConnect() { return mSock != INVALID_SOCKET; }
+	bool IsConnected() { return mSock != INVALID_SOCKET; }
 
 	SOCKET GetSock() { return mSock; }
 
